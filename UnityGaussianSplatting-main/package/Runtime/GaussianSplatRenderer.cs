@@ -700,6 +700,8 @@ public void OnEnable()
             m_Sorter.Dispatch(cmd, m_SorterArgs);
             cmd.EndSample(s_ProfSort);
         }
+            private Vector3? swipeStartScreen = null;
+            private Vector3? swipeEndScreen = null;
 
         public void Update()
         {
@@ -718,23 +720,129 @@ public void OnEnable()
                     Debug.LogError($"{nameof(GaussianSplatRenderer)} component is not set up correctly (Resource references are missing), or platform does not support compute shaders");
                 }
             }
-
-
-
-            // Detect Spacebar Press to Split Splats
-             if (Input.GetKeyDown(KeyCode.Space))
-            {
-                SplitSplatObject(new Plane()
+               if (Input.GetMouseButtonDown(0))
                 {
-                    point = Vector3.Lerp(m_Asset.boundsMin, m_Asset.boundsMax, .3f),
-                    normal = new Vector3(1, 2, 0).normalized
-                });
+                    swipeStartScreen = Input.mousePosition;
+                }
 
+                if (Input.GetMouseButtonUp(0) && swipeStartScreen.HasValue)
+                {
+                    swipeEndScreen = Input.mousePosition;
+                    TrySliceIfSwipeIntersectsView(swipeStartScreen.Value, swipeEndScreen.Value);
+                    swipeStartScreen = swipeEndScreen = null;
+                }
 
-            }
-            
+                // Original slicing method (for testing)
+                if (Input.GetKeyDown(KeyCode.Space))
+                {
+                    SplitSplatObject(new Plane()
+                    {
+                        point = Vector3.Lerp(transform.TransformPoint(m_Asset.boundsMin), transform.TransformPoint(m_Asset.boundsMax), .5f),
+                        normal = new Vector3(1, 1, 0).normalized
+                    });
+                }
 
         }
+
+
+private void TrySliceIfSwipeIntersectsView(Vector3 startScreen, Vector3 endScreen)
+{
+    // Project corners to screen space
+    Vector2[] screenCorners = getCorners().Select(c => (Vector2)Camera.main.WorldToScreenPoint(c)).ToArray();
+
+    float minX = screenCorners.Min(p => p.x);
+    float maxX = screenCorners.Max(p => p.x);
+    float minY = screenCorners.Min(p => p.y);
+    float maxY = screenCorners.Max(p => p.y);
+    Rect screenBounds = new Rect(minX, minY, maxX - minX, maxY - minY);
+
+    if (!LineIntersectsRect(startScreen, endScreen, screenBounds))
+    {
+        Debug.Log("Swipe does not intersect object screen bounds — skipping slice.");
+        return;
+    }
+
+    // World-space positions of swipe ends
+    float depth = Vector3.Distance(Camera.main.transform.position,
+        transform.TransformPoint(Vector3.Lerp(m_Asset.boundsMin, m_Asset.boundsMax, 0.5f)));
+
+    Vector3 worldStart = Camera.main.ScreenToWorldPoint(new Vector3(startScreen.x, startScreen.y, depth));
+    Vector3 worldEnd = Camera.main.ScreenToWorldPoint(new Vector3(endScreen.x, endScreen.y, depth));
+
+    Vector3 swipeDir = worldEnd - worldStart;
+    if (swipeDir.magnitude < 0.01f)
+    {
+        Debug.Log("Swipe too short to be valid.");
+        return;
+    }
+
+    Vector3 camForward = Camera.main.transform.forward;
+    Vector3 planeNormalWorld = Vector3.Cross(swipeDir, camForward).normalized;
+
+    // Optimization: Find point on swipe closest to object center
+    Vector3 objectCenterWorld = transform.TransformPoint(Vector3.Lerp(m_Asset.boundsMin, m_Asset.boundsMax, 0.5f));
+
+    Vector3 swipeDirectionNormalized = swipeDir.normalized;
+    Vector3 vectorToCenter = objectCenterWorld - worldStart;
+    float projectionLength = Vector3.Dot(vectorToCenter, swipeDirectionNormalized);
+    projectionLength = Mathf.Clamp(projectionLength, 0f, swipeDir.magnitude);
+
+    Vector3 optimizedPointWorld = worldStart + swipeDirectionNormalized * projectionLength;
+
+    // Verify that optimized point is inside object bounds
+    Bounds localBounds = new Bounds(Vector3.Lerp(m_Asset.boundsMin, m_Asset.boundsMax, 0.5f),
+                                    m_Asset.boundsMax - m_Asset.boundsMin);
+    Vector3 optimizedPointLocalCheck = transform.InverseTransformPoint(optimizedPointWorld);
+
+    if (!localBounds.Contains(optimizedPointLocalCheck))
+    {
+        Debug.LogWarning("Optimized slicing point is outside object bounds. Skipping slice.");
+        return;
+    }
+
+
+    Debug.Log($"[Slicing Plane] World Point: {optimizedPointWorld}, World Normal: {planeNormalWorld}");
+    Debug.DrawLine(worldStart, worldEnd, Color.yellow, 3f);
+    Debug.DrawRay(optimizedPointWorld, planeNormalWorld * 0.3f, Color.green, 3f);
+
+    Debug.DrawRay(optimizedPointWorld, Vector3.up * 0.1f, Color.red, 4f);
+    Debug.DrawRay(optimizedPointWorld, Vector3.right * 0.1f, Color.blue, 4f);
+    Debug.DrawRay(optimizedPointWorld, Vector3.forward * 0.1f, Color.white, 4f);
+
+    SplitSplatObject(new Plane
+    {
+        point = optimizedPointWorld,  
+        normal = planeNormalWorld 
+    });
+}
+
+
+
+
+private bool LineIntersectsRect(Vector2 p1, Vector2 p2, Rect rect)
+{
+    Vector2 topLeft = new Vector2(rect.xMin, rect.yMax);
+    Vector2 topRight = new Vector2(rect.xMax, rect.yMax);
+    Vector2 bottomLeft = new Vector2(rect.xMin, rect.yMin);
+    Vector2 bottomRight = new Vector2(rect.xMax, rect.yMin);
+
+    return LineIntersect(p1, p2, topLeft, topRight) ||
+           LineIntersect(p1, p2, topRight, bottomRight) ||
+           LineIntersect(p1, p2, bottomRight, bottomLeft) ||
+           LineIntersect(p1, p2, bottomLeft, topLeft) ||
+           rect.Contains(p1) || rect.Contains(p2);
+}
+
+private bool LineIntersect(Vector2 A, Vector2 B, Vector2 C, Vector2 D)
+{
+    float det = (B.x - A.x) * (D.y - C.y) - (B.y - A.y) * (D.x - C.x);
+    if (Mathf.Abs(det) < Mathf.Epsilon) return false; // Parallel
+
+    float lambda = ((D.y - C.y) * (D.x - A.x) + (C.x - D.x) * (D.y - A.y)) / det;
+    float gamma = ((A.y - B.y) * (D.x - A.x) + (B.x - A.x) * (D.y - A.y)) / det;
+
+    return (0 <= lambda && lambda <= 1) && (0 <= gamma && gamma <= 1);
+}
 
 
 
@@ -768,6 +876,10 @@ private (GameObject, GameObject) cloneSplatObject() {
     leftRenderer.OnEnable();
     rightRenderer.OnEnable();
 
+    // tranform the new objects to match the original object
+    mergeObjectTransform(leftSplatObject);
+    mergeObjectTransform(rightSplatObject);
+
     return (leftSplatObject, rightSplatObject);
 }
 
@@ -783,6 +895,11 @@ private Vector3[] getCorners() {
     corners[5] = new Vector3(m_Asset.boundsMax.x, m_Asset.boundsMin.y, m_Asset.boundsMax.z);
     corners[6] = new Vector3(m_Asset.boundsMax.x, m_Asset.boundsMax.y, m_Asset.boundsMin.z);
     corners[7] = m_Asset.boundsMax;
+
+    for (int i = 0; i < corners.Length; i++)
+    {
+        corners[i] = transform.TransformPoint(corners[i]);
+    }
 
     return corners;
 }
@@ -835,10 +952,10 @@ private (Vector3[], Vector3[]) splitCorners(Plane plane, Vector3[] corners) {
 }
 
 
-private void mergeObjectTransform(GameObject target, Vector3 separationVector) {
+private void mergeObjectTransform(GameObject target) {
     target.transform.rotation = transform.rotation;
     target.transform.localScale = transform.localScale;
-    target.transform.position = transform.position + separationVector;
+    target.transform.position = transform.position;
 }
 
 
@@ -870,16 +987,13 @@ private Vector3 invChangeBasis(Vector3 point, Plane plane) { // point and plane 
 private GameObject createCutoutObject(Vector3[] points, Plane plane) {
     // create base object
     GameObject cutoutObject = new GameObject("Cutout");
-    cutoutObject.transform.parent = gameObject.transform;
+    cutoutObject.transform.parent = transform;
     m_Cutouts = new GaussianCutout[1];
     m_Cutouts[0] = cutoutObject.AddComponent<GaussianCutout>();
     m_Cutouts[0].m_Type = GaussianCutout.Type.Box;
 
     // change basis of points into plane basis
-    for (int i = 0; i < points.Length; i++) points[i] = transform.InverseTransformPoint(changeBasis(transform.TransformPoint(points[i]), plane));
-    
-    // draw the points in debug
-    foreach (var p in points) Debug.DrawLine(transform.TransformPoint(p), transform.TransformPoint(p) + Vector3.up * 0.03f, Color.green, 30f);
+    for (int i = 0; i < points.Length; i++) points[i] = changeBasis(points[i], plane);
 
     // create minimum bounding box within new basis
     Bounds bounds = new Bounds(points[0], Vector3.zero); // within local object coordinate space
@@ -887,28 +1001,77 @@ private GameObject createCutoutObject(Vector3[] points, Plane plane) {
     bounds = dilateBoundingBox(bounds);
 
     // scale and rotate back to world basis
-    cutoutObject.transform.position = transform.InverseTransformPoint(invChangeBasis(transform.TransformPoint(bounds.center), plane));
-    cutoutObject.transform.rotation = Quaternion.FromToRotation(transform.TransformDirection(Vector3.right), plane.normal);
+    cutoutObject.transform.position = invChangeBasis(bounds.center, plane);
+    Vector3 up = invChangeBasis(Vector3.up, plane);
+    Vector3 fwd = invChangeBasis(Vector3.forward, plane);
+    Vector3 origin = invChangeBasis(Vector3.zero, plane);
+    cutoutObject.transform.rotation *= Quaternion.LookRotation(fwd-origin, up-origin);
     cutoutObject.transform.localScale = bounds.size/2;
 
     return cutoutObject;
 }
+
+private void AddPhysics(GameObject obj, float floorOffset = 1.5f)
+{
+    // Add BoxCollider
+    var collider = obj.AddComponent<BoxCollider>();
+
+    if (obj.TryGetComponent<GaussianSplatRenderer>(out var renderer) && renderer.m_Cutouts != null && renderer.m_Cutouts.Length > 0)
+    {
+        collider.center = renderer.m_Cutouts[0].transform.localPosition;
+        collider.size = renderer.m_Cutouts[0].transform.localScale * 2f;
+    }
+    else
+    {
+        Debug.LogWarning("Could not find cutout bounds for physics collider.");
+    }
+
+    // Add Rigidbody
+    var rb = obj.AddComponent<Rigidbody>();
+    rb.useGravity = true;
+    rb.mass = 1f;
+    rb.drag = 3f;
+    rb.angularDrag = 0.05f;
+
+    // 🆕 Create floor in world space
+    CreateFloorBelow(obj.transform.position, floorOffset);
+}
+//
+private void CreateFloorBelow(Vector3 centerPosition, float offset)
+{
+    // Create floor GameObject
+    GameObject floor = new GameObject("VirtualFloor");
+    
+    // Set floor position BELOW the object
+    floor.transform.position = centerPosition + new Vector3(0, -offset, 0);
+    floor.transform.rotation = Quaternion.identity;
+    floor.transform.localScale = Vector3.one;
+
+    // Add BoxCollider
+    var floorCollider = floor.AddComponent<BoxCollider>();
+    floorCollider.size = new Vector3(5f, 0.1f, 5f); // wide flat floor
+    floorCollider.center = Vector3.zero;
+
+    // Add Rigidbody (static)
+    var floorRb = floor.AddComponent<Rigidbody>();
+    floorRb.isKinematic = true; // so it doesn't move
+}
+
+
 
 private void SplitSplatObject(Plane plane)
 {    
     // draw the plane for debugging
     // generate square of points to draw plane in debug
     Vector3[] square = new Vector3[4];
-    square[0] = transform.TransformPoint(plane.point) + Vector3.Cross(transform.TransformDirection(plane.normal), Vector3.up) * 0.1f;
-    square[1] = transform.TransformPoint(plane.point) + Vector3.Cross(transform.TransformDirection(plane.normal), Vector3.forward) * 0.1f;
-    square[2] = transform.TransformPoint(plane.point) + Vector3.Cross(transform.TransformDirection(plane.normal), Vector3.left) * 0.1f;
-    square[3] = transform.TransformPoint(plane.point) + Vector3.Cross(transform.TransformDirection(plane.normal), Vector3.right) * 0.1f;
+    square[0] = plane.point + Vector3.Cross(plane.normal, Vector3.up) * 0.1f;
+    square[1] = plane.point + Vector3.Cross(plane.normal, Vector3.forward) * 0.1f;
+    square[2] = plane.point + Vector3.Cross(plane.normal, Vector3.left) * 0.1f;
+    square[3] = plane.point + Vector3.Cross(plane.normal, Vector3.right) * 0.1f;
     Debug.DrawLine(square[0], square[1], Color.cyan, 30f);
     Debug.DrawLine(square[0], square[2], Color.cyan, 30f);
     Debug.DrawLine(square[1], square[3], Color.cyan, 30f);
     Debug.DrawLine(square[2], square[3], Color.cyan, 30f);
-
-
 
     // create 2 new cloned splat objects
     (GameObject leftSplatObject, GameObject rightSplatObject) = cloneSplatObject();
@@ -919,18 +1082,21 @@ private void SplitSplatObject(Plane plane)
     (Vector3[] leftPoints, Vector3[] rightPoints) = splitCorners(plane, corners);
     
     // for debugging draw the left points in blue and right points in red
-    foreach (var p in leftPoints) Debug.DrawLine(transform.TransformPoint(p), transform.TransformPoint(p) + Vector3.up * 0.03f, Color.blue, 30f);
-    foreach (var p in rightPoints) Debug.DrawLine(transform.TransformPoint(p), transform.TransformPoint(p) + Vector3.up * 0.03f, Color.red, 30f);
+    foreach (var p in leftPoints) Debug.DrawLine(p, p + Vector3.up * 0.03f, Color.blue, 30f);
+    foreach (var p in rightPoints) Debug.DrawLine(p, p + Vector3.up * 0.03f, Color.red, 30f);
 
     // create 2 new cutout objects
     leftSplatObject.GetComponent<GaussianSplatRenderer>().createCutoutObject(leftPoints, plane);
     rightSplatObject.GetComponent<GaussianSplatRenderer>().createCutoutObject(rightPoints, plane);
 
-    // tranform the new objects to match the original object
     // and move them apart slightly to visualize cut
-    Vector3 separationVector = plane.normal.normalized * 0.1f;
-    mergeObjectTransform(leftSplatObject, -separationVector);
-    mergeObjectTransform(rightSplatObject, separationVector);
+    Vector3 separationVector = plane.normal.normalized * .1f;
+    leftSplatObject.transform.position -= separationVector;
+    rightSplatObject.transform.position += separationVector;    
+
+    // // 🆕 Add physics
+    AddPhysics(leftSplatObject);
+    AddPhysics(rightSplatObject);
 
     // destroy the original object
     Destroy(gameObject);
